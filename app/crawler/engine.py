@@ -1,4 +1,4 @@
-"""爬虫引擎核心 - 模拟人行为"""
+"""爬虫引擎核心 - 使用 x.com GraphQL API"""
 import time
 import random
 import re
@@ -14,33 +14,82 @@ from app.api.tweets import save_tweet, get_tweet_author_info
 logger = logging.getLogger(__name__)
 
 # 阅读速度：中文约400字/分钟，英文约200词/分钟
-READ_SPEED_CHARS_PER_SEC = 6.5  # 中文字符
-READ_SPEED_WORDS_PER_SEC = 3.3   # 英文单词
+READ_SPEED_CHARS_PER_SEC = 6.5
+READ_SPEED_WORDS_PER_SEC = 3.3
 
 # 行为延迟范围（秒）
 MIN_ACTION_DELAY = 2.0
 MAX_ACTION_DELAY = 8.0
 
-# 页面滚动间隔
-SCROLL_INTERVAL_MIN = 4.0
-SCROLL_INTERVAL_MAX = 12.0
-
 # 每次爬取的最大推文数
 MAX_TWEETS_PER_CRAWL = 50
+
+# x.com GraphQL 配置
+BEARER_TOKEN = "AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs=1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA"
+GRAPHQL_ENDPOINT = "https://x.com/i/api/graphql"
+QUERY_IDS = {
+    "UserByScreenName": "IGgvgiOx4QZndDHuD3x9TQ",
+    "UserTweets": "PNd0vlufvrcIwrAnBYKE9g",
+}
+
+# 基础 feature switches（从x.com main.js提取）
+BASE_FEATURES = [
+    "rweb_video_screen_enabled", "rweb_cashtags_enabled",
+    "profile_label_improvements_pcf_label_in_post_enabled",
+    "responsive_web_profile_redirect_enabled", "rweb_tipjar_consumption_enabled",
+    "verified_phone_label_enabled",
+    "creator_subscriptions_tweet_preview_api_enabled",
+    "responsive_web_graphql_timeline_navigation_enabled",
+    "responsive_web_graphql_skip_user_profile_image_extensions_enabled",
+    "premium_content_api_read_enabled",
+    "communities_web_enable_tweet_community_results_fetch",
+    "c9s_tweet_anatomy_moderator_badge_enabled",
+    "responsive_web_grok_analyze_button_fetch_trends_enabled",
+    "responsive_web_grok_analyze_post_followups_enabled",
+    "rweb_cashtags_composer_attachment_enabled",
+    "responsive_web_jetfuel_frame",
+    "responsive_web_grok_share_attachment_enabled",
+    "responsive_web_grok_annotations_enabled",
+    "articles_preview_enabled",
+    "responsive_web_edit_tweet_api_enabled",
+    "rweb_conversational_replies_downvote_enabled",
+    "graphql_is_translatable_rweb_tweet_is_translatable_enabled",
+    "view_counts_everywhere_api_enabled",
+    "longform_notetweets_consumption_enabled",
+    "responsive_web_twitter_article_tweet_consumption_enabled",
+    "content_disclosure_indicator_enabled",
+    "content_disclosure_ai_generated_indicator_enabled",
+    "responsive_web_grok_show_grok_translated_post",
+    "responsive_web_grok_analysis_button_from_backend",
+    "post_ctas_fetch_enabled",
+    "freedom_of_speech_not_reach_fetch_enabled",
+    "standardized_nudges_misinfo",
+    "tweet_with_visibility_results_prefer_gql_limited_actions_policy_enabled",
+    "longform_notetweets_rich_text_read_enabled",
+    "longform_notetweets_inline_media_enabled",
+    "responsive_web_grok_image_annotation_enabled",
+    "responsive_web_grok_imagine_annotation_enabled",
+    "responsive_web_grok_community_note_auto_translation_is_enabled",
+    "responsive_web_enhance_cards_enabled",
+]
+
+BASE_FIELD_TOGGLES = [
+    "withPayments", "withAuxiliaryUserLabels",
+    "withArticleRichContentState", "withArticlePlainText",
+    "withArticleSummaryText", "withArticleVoiceOver",
+    "withGrokAnalyze", "withDisallowedReplyControls",
+]
 
 
 def simulate_reading_time(text: str) -> float:
     """根据文本长度计算模拟阅读时间"""
     if not text:
         return random.uniform(1.0, 3.0)
-    # 粗略统计中英文混合
     chinese_chars = len(re.findall(r'[\u4e00-\u9fff]', text))
     english_words = len(re.findall(r'[a-zA-Z]+', text))
     read_time = (chinese_chars / READ_SPEED_CHARS_PER_SEC) + (english_words / READ_SPEED_WORDS_PER_SEC)
-    # 加随机抖动 ±30%
     jitter = random.uniform(0.7, 1.3)
     read_time *= jitter
-    # 至少1秒，最长30秒
     return max(1.0, min(read_time, 30.0))
 
 
@@ -51,7 +100,7 @@ def random_delay(min_s: float = MIN_ACTION_DELAY, max_s: float = MAX_ACTION_DELA
 
 
 def extract_tweet_links(text: str) -> list[str]:
-    """从推文文本中提取所有链接，包括 t.co 短链接"""
+    """从推文文本中提取所有链接"""
     urls = re.findall(r'https?://t\.co/\w+', text)
     urls += re.findall(r'https?://(?!t\.co)[^\s]+', text)
     return list(set(urls))
@@ -66,37 +115,105 @@ def resolve_url(url: str, client: httpx.Client) -> str:
         return url
 
 
-def parse_twitter_api_tweet(tweet: dict) -> dict:
-    """将 Twitter API v2 返回的推文数据解析为统一格式"""
-    # 支持 v2 api 和 graphql 两种格式
-    entities = tweet.get("entities", {})
+def _make_graphql_request(client: httpx.Client, operation: str, variables: dict) -> dict:
+    """发送GraphQL请求到x.com"""
+    qid = QUERY_IDS.get(operation)
+    if not qid:
+        raise ValueError(f"Unknown operation: {operation}")
 
-    # v2 api 格式
-    if "text" in tweet:
+    payload = {
+        "variables": variables,
+        "queryId": qid,
+    }
+    if operation == "UserTweets":
+        payload["features"] = BASE_FEATURES
+        payload["fieldToggles"] = BASE_FIELD_TOGGLES
+
+    resp = client.post(
+        f"{GRAPHQL_ENDPOINT}/{qid}/{operation}",
+        json=payload,
+    )
+    if resp.status_code != 200:
+        raise Exception(f"GraphQL {operation} failed: HTTP {resp.status_code} - {resp.text[:200]}")
+    return resp.json()
+
+
+def _extract_tweets_from_timeline(data: dict) -> list[dict]:
+    """从GraphQL timeline中提取推文"""
+    tweets = []
+    try:
+        timeline = data["data"]["user"]["result"]["timeline"]["timeline"]
+        for instruction in timeline.get("instructions", []):
+            if instruction.get("type") != "TimelineAddEntries":
+                continue
+            for entry in instruction.get("entries", []):
+                item = entry.get("content", {}).get("itemContent", {})
+                if item.get("itemType") != "TimelineTweet":
+                    continue
+                tweet_result = item.get("tweet_results", {}).get("result", {})
+                if tweet_result.get("__typename") == "Tweet":
+                    tweets.append(tweet_result)
+    except (KeyError, TypeError, IndexError) as e:
+        logger.warning(f"提取推文失败: {e}")
+    return tweets
+
+
+def _tweet_to_record(tweet: dict, screen_name: str) -> dict | None:
+    """将GraphQL推文转为统一记录格式"""
+    try:
+        core = tweet.get("core", {})
+        user_result = core.get("user_results", {}).get("result", {})
+        user_core = user_result.get("core", {})
+        legacy = tweet.get("legacy", {})
+        if not legacy and "__typename" in tweet:
+            # 新格式：legacy 可能在别的位置
+            legacy = tweet.get("legacy", {})
+
+        if not legacy or not legacy.get("full_text"):
+            # 有些推文没有 legacy，跳过
+            return None
+
+        tweet_id = tweet.get("rest_id", "")
+        full_text = legacy.get("full_text", "")
+
         # 提取媒体
         media_urls = []
-        attachments = tweet.get("attachments", {})
-        if "media_keys" in attachments:
-            media_urls = attachments.get("media_keys", [])
+        entities = legacy.get("entities", {})
+        extended_entities = legacy.get("extended_entities", {})
+        media_list = extended_entities.get("media", []) or entities.get("media", [])
+        for m in media_list:
+            if "media_url_https" in m:
+                media_urls.append(m["media_url_https"])
+            elif "media_url" in m:
+                media_urls.append(m["media_url"])
+
+        created_at = legacy.get("created_at", "")
+        try:
+            dt = datetime.strptime(created_at, "%a %b %d %H:%M:%S %z %Y")
+            created_at = dt.strftime("%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            pass
 
         return {
-            "tweet_id": tweet.get("id", ""),
-            "author_screen_name": "",
-            "author_name": tweet.get("author_name", ""),
-            "author_avatar": tweet.get("author_profile_image_url", ""),
-            "author_bio": tweet.get("author_description", ""),
-            "content": tweet.get("text", ""),
-            "created_at": tweet.get("created_at", ""),
-            "url": f"https://x.com/i/web/status/{tweet.get('id', '')}",
+            "tweet_id": tweet_id,
+            "author_screen_name": screen_name,
+            "author_name": user_core.get("name", screen_name),
+            "author_avatar": user_result.get("avatar", {}).get("image_url", "").replace("_normal", "_400x400"),
+            "author_bio": user_result.get("legacy", {}).get("description", user_result.get("profile_bio", {}).get("description", "")),
+            "content": full_text,
+            "created_at": created_at,
+            "url": f"https://x.com/{screen_name}/status/{tweet_id}",
             "media_urls": media_urls,
         }
-    return None
+    except Exception as e:
+        logger.warning(f"解析推文记录失败: {e}")
+        return None
 
 
 def crawl_user_tweets(config: dict, max_tweets: int = MAX_TWEETS_PER_CRAWL,
                      status_callback=None) -> tuple[int, list[str]]:
     """
-    爬取指定用户的推文
+    爬取指定用户的推文（使用 x.com GraphQL API）
     返回 (爬取成功数, [错误信息])
     """
     errors = []
@@ -110,7 +227,6 @@ def crawl_user_tweets(config: dict, max_tweets: int = MAX_TWEETS_PER_CRAWL,
     screen_name = config.get("crawler_user", "").lstrip("@")
     prompt = config.get("prompt", "")
 
-    # 准备Cookie
     cookie_str = f"ct0={cookie_ct0}; auth_token={cookie_auth_token}"
     other_cookies = config.get("cookie_other", {})
     if isinstance(other_cookies, dict):
@@ -126,8 +242,9 @@ def crawl_user_tweets(config: dict, max_tweets: int = MAX_TWEETS_PER_CRAWL,
         "Referer": f"https://x.com/{screen_name}",
         "Origin": "https://x.com",
         "X-Csrf-Token": cookie_ct0,
-        "Authorization": "Bearer AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs"
-                          "=1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA",
+        "Authorization": f"Bearer {BEARER_TOKEN}",
+        "X-Twitter-Active-User": "yes",
+        "X-Twitter-Client-Language": "zh",
     }
 
     try:
@@ -137,116 +254,114 @@ def crawl_user_tweets(config: dict, max_tweets: int = MAX_TWEETS_PER_CRAWL,
             timeout=30,
             follow_redirects=True,
         ) as client:
-            # 先访问用户页面获取用户信息
             random_delay()
 
-            # 获取用户信息
-            user_by_screen_name_url = f"https://api.x.com/1.1/users/show.json?screen_name={screen_name}"
+            # 1. 获取用户信息
             if status_callback:
                 status_callback(f"正在获取用户 @{screen_name} 信息...")
-            resp = client.get(user_by_screen_name_url)
-            simulate_reading_time(resp.text[:200])
+
+            user_data = _make_graphql_request(client, "UserByScreenName", {
+                "screen_name": screen_name,
+                "withGrokTranslatedBio": False,
+            })
+
+            user_result = user_data.get("data", {}).get("user", {}).get("result", {})
+            rest_id = user_result.get("rest_id", "")
+            if not rest_id:
+                return 0, [f"无法获取用户 @{screen_name} 的ID"]
+
+            author_name = user_result.get("core", {}).get("name", screen_name)
+            author_avatar = user_result.get("avatar", {}).get("image_url", "").replace("_normal", "_400x400")
+            author_bio = user_result.get("legacy", {}).get("description", "")
+
+            # 模拟阅读用户资料
+            simulate_reading_time(f"{author_name} {author_bio}")
             random_delay()
 
-            if resp.status_code != 200:
-                return 0, [f"获取用户信息失败: HTTP {resp.status_code}"]
-
-            user_data = resp.json()
-            user_id = user_data.get("id_str", "")
-            author_name = user_data.get("name", screen_name)
-            author_avatar = user_data.get("profile_image_url_https", "").replace("_normal", "_400x400")
-            author_bio = user_data.get("description", "")
-
-            # 获取用户时间线
-            timeline_url = f"https://api.x.com/1.1/statuses/user_timeline.json"
-            params = {
-                "user_id": user_id,
-                "count": min(max_tweets, 200),
-                "include_rts": 1,
-                "exclude_replies": 0,
-                "tweet_mode": "extended",
-                "include_ext_alt_text": "true",
-                "include_entities": "true",
-            }
-
-            resp = client.get(timeline_url, params=params)
-            simulate_reading_time(resp.text[:500])
-            random_delay()
-
-            if resp.status_code != 200:
-                return 0, [f"获取推文失败: HTTP {resp.status_code}"]
-
-            tweets = resp.json()
-            if isinstance(tweets, dict) and "errors" in tweets:
-                return 0, [f"API错误: {json.dumps(tweets['errors'][:3])}"]
-
-            if not isinstance(tweets, list):
-                return 0, [f"意外的响应格式"]
-
-            new_tweets = tweets[:max_tweets]
-            total = len(new_tweets)
+            # 2. 获取推文列表
             if status_callback:
-                status_callback(f"获取到 {total} 条推文，开始爬取...")
+                status_callback(f"正在获取 @{screen_name} 的推文...")
 
-            for idx, tweet_data in enumerate(new_tweets):
-                tweet = tweet_data.get("retweeted_status", tweet_data)
-                full_text = tweet.get("full_text", tweet.get("text", ""))
+            has_more = True
+            cursor = None
+            all_tweets = []
 
-                # 如果有prompt，检查是否匹配
-                if prompt:
-                    prompt_keywords = [k.strip().lower() for k in prompt.split() if k.strip()]
-                    if prompt_keywords and not any(kw in full_text.lower() for kw in prompt_keywords):
+            while has_more and len(all_tweets) < max_tweets:
+                tweet_vars = {
+                    "userId": rest_id,
+                    "count": min(max_tweets - len(all_tweets), 20),
+                    "includePromotedContent": False,
+                    "withQuickPromoteEligibilityTweetReach": False,
+                    "withVoice": False,
+                    "withV2Timeline": True,
+                }
+                if cursor:
+                    tweet_vars["cursor"] = cursor
+
+                tweets_data = _make_graphql_request(client, "UserTweets", tweet_vars)
+                tweets = _extract_tweets_from_timeline(tweets_data)
+                all_tweets.extend(tweets)
+
+                # 获取下一页cursor
+                try:
+                    timeline = tweets_data["data"]["user"]["result"]["timeline"]["timeline"]
+                    for instruction in timeline.get("instructions", []):
+                        if instruction.get("type") == "TimelineAddEntries":
+                            for entry in reversed(instruction.get("entries", [])):
+                                eid = entry.get("entryId", "")
+                                if eid.startswith("cursor-bottom-"):
+                                    cursor = entry.get("content", {}).get("value", "")
+                                    has_more = bool(cursor)
+                                    break
+                            else:
+                                has_more = False
+                        elif instruction.get("type") == "TimelineClearCache":
+                            pass
+                except Exception:
+                    has_more = False
+
+                if cursor and len(all_tweets) < max_tweets:
+                    random_delay(3, 8)
+
+            if status_callback:
+                status_callback(f"获取到 {len(all_tweets)} 条推文，开始处理...")
+
+            # 3. 过滤和保存推文
+            prompt_keywords = []
+            if prompt:
+                prompt_keywords = [k.strip().lower() for k in prompt.split() if k.strip()]
+
+            for idx, tweet in enumerate(all_tweets):
+                record = _tweet_to_record(tweet, screen_name)
+                if not record:
+                    continue
+
+                # 关键词过滤
+                if prompt_keywords:
+                    full_text_lower = record["content"].lower()
+                    if not any(kw in full_text_lower for kw in prompt_keywords):
                         continue
 
-                # 提取媒体
-                media_urls = []
-                entities = tweet.get("entities", {})
-                if "media" in entities:
-                    for m in entities["media"]:
-                        if "media_url_https" in m:
-                            media_urls.append(m["media_url_https"])
-                        elif "media_url" in m:
-                            media_urls.append(m["media_url"])
-
-                tweet_id = tweet.get("id_str", "")
-                created_at = tweet.get("created_at", "")
-
-                # 转换Twitter日期格式
-                try:
-                    dt = datetime.strptime(created_at, "%a %b %d %H:%M:%S %z %Y")
-                    created_at = dt.strftime("%Y-%m-%d %H:%M:%S")
-                except ValueError:
-                    pass
-
-                tweet_record = {
-                    "tweet_id": tweet_id,
-                    "author_screen_name": screen_name,
-                    "author_name": author_name,
-                    "author_avatar": author_avatar,
-                    "author_bio": author_bio,
-                    "content": full_text,
-                    "created_at": created_at,
-                    "url": f"https://x.com/{screen_name}/status/{tweet_id}",
-                    "media_urls": media_urls,
-                }
-
-                save_tweet(config["id"], tweet_record)
+                save_tweet(config["id"], record)
                 count += 1
 
-                if status_callback and total > 0:
-                    status_callback(f"爬取进度: {count}/{total}")
+                if status_callback:
+                    status_callback(f"爬取进度: {count}/已处理{idx+1}条")
 
-                # 提取链接并保存
-                links = extract_tweet_links(full_text)
+                # 提取链接
+                links = extract_tweet_links(record["content"])
                 for link in links:
                     resolved = resolve_url(link, client)
                     from app.api.tweets import save_link
-                    save_link(config["id"], tweet_id, link, resolved)
+                    save_link(config["id"], record["tweet_id"], link, resolved)
                     random_delay(0.5, 2.0)
 
                 # 模拟阅读每条推文
-                read_time = simulate_reading_time(full_text)
+                read_time = simulate_reading_time(record["content"])
                 time.sleep(read_time)
+
+            if status_callback and count == 0 and len(all_tweets) > 0:
+                status_callback(f"共 {len(all_tweets)} 条推文均被关键词过滤，无新增")
 
     except Exception as e:
         errors.append(f"爬取异常: {str(e)}")
