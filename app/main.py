@@ -27,6 +27,14 @@ logger = logging.getLogger(__name__)
 _crawl_locks = {}
 _scheduler_running = False
 
+# 爬取状态追踪
+_crawl_status: dict[int, dict] = {}  # config_id -> {running, progress, count, errors, started_at}
+
+def _set_crawl_status(config_id: int, **kwargs):
+    if config_id not in _crawl_status:
+        _crawl_status[config_id] = {"running": False, "progress": "", "count": 0, "errors": [], "started_at": None}
+    _crawl_status[config_id].update(**kwargs)
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -139,11 +147,14 @@ def _run_crawl(config_id: int):
         cfg = get_config(config_id)
         if not cfg:
             logger.warning(f"配置 {config_id} 不存在")
+            _set_crawl_status(config_id, running=False, progress="配置不存在", errors=["配置不存在"])
             return
         logger.info(f"开始爬取: {cfg['crawler_user']}")
-        count, errors = crawl_user_tweets(cfg)
+        _set_crawl_status(config_id, running=True, progress=f"正在爬取 @{cfg['crawler_user']}...", count=0, errors=[], started_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+        count, errors = crawl_user_tweets(cfg, status_callback=lambda msg: _set_crawl_status(config_id, progress=msg))
         if count > 0:
             update_last_crawl_time(config_id)
+        _set_crawl_status(config_id, running=False, progress="完成" if not errors else f"完成（{len(errors)}个错误）", count=count, errors=errors[:5])
         msg = f"爬取 {cfg['crawler_user']}: 新增 {count} 条推文"
         if errors:
             msg += f"，错误: {'; '.join(errors[:3])}"
@@ -225,6 +236,13 @@ def api_crawl_now(config_id: int):
     return JSONResponse({"ok": True, "message": msg})
 
 
+@app.get("/api/configs/{config_id}/crawl-status")
+def api_crawl_status(config_id: int):
+    """获取爬取状态"""
+    status = _crawl_status.get(config_id, {"running": False, "progress": "", "count": 0, "errors": [], "started_at": None})
+    return JSONResponse(status)
+
+
 @app.get("/api/configs/{config_id}/tweets")
 def api_get_tweets(config_id: int, limit: int = 50, offset: int = 0):
     cfg = get_config(config_id)
@@ -296,7 +314,8 @@ tr:hover td { background:#f8f9fe; }
 .badge-on { background:#e8f5e9; color:#17bf63; }
 .badge-off { background:#fce4ec; color:#e0245e; }
 .badge-sch { background:#e3f2fd; color:#1da1f2; }
-.actions { display:flex; gap:6px; flex-wrap:wrap; }
+.actions { display:flex; gap:6px; flex-wrap:wrap; align-items:center; }
+.crawl-status { font-size:11px; color:#666; white-space:nowrap; }
 .tag { display:inline-block; padding:2px 8px; background:#f0f2f5; border-radius:4px; font-size:11px; color:#666; margin-right:4px; margin-bottom:2px; }
 
 /* Modal */
@@ -318,6 +337,7 @@ tr:hover td { background:#f8f9fe; }
 .toast-success { background:#17bf63; }
 .toast-error { background:#e0245e; }
 @keyframes slideIn { from { transform:translateY(20px); opacity:0; } to { transform:translateY(0); opacity:1; } }
+@keyframes pulse { 0%,100% { opacity:1; } 50% { opacity:.4; } }
 </style>
 </head>
 <body>
@@ -420,8 +440,10 @@ function renderTable(data) {
       <td>${c.schedule_expr || '-'}</td>
       <td>${c.last_crawl_time ? new Date(c.last_crawl_time).toLocaleString() : '-'}</td>
       <td class="actions">
+        <span id="crawlStatus${c.id}" class="crawl-status"></span>
         <button class="btn btn-primary btn-sm" onclick="crawlNow(${c.id})">爬取</button>
         <button class="btn btn-warning btn-sm" onclick="editConfig(${c.id})">编辑</button>
+        <button class="btn btn-success btn-sm" onclick="window.open('/reader/${c.id}','_blank')">阅读</button>
         <button class="btn btn-danger btn-sm" onclick="deleteConfig(${c.id})">删除</button>
       </td>
     </tr>`;
@@ -505,9 +527,24 @@ async function editConfig(id) {
 async function crawlNow(id) {
   const res = await fetch('/api/configs/' + id + '/crawl', { method:'POST' });
   if (!res.ok) { showToast('爬取失败', 'error'); return; }
-  const result = await res.json();
-  showToast(result.message || '爬取完成', 'success');
-  await loadConfigs();
+  showToast('开始爬取...', 'success');
+  // 轮询爬取状态
+  const statusEl = document.getElementById('crawlStatus' + id);
+  const poll = setInterval(async () => {
+    const sr = await fetch('/api/configs/' + id + '/crawl-status');
+    const st = await sr.json();
+    if (statusEl) {
+      if (st.running) {
+        statusEl.innerHTML = '<span style="color:#1da1f2;animation:pulse 1s infinite">● ' + (st.progress || '爬取中') + '</span>';
+      } else {
+        statusEl.innerHTML = '<span style="color:#17bf63">✓ ' + (st.progress || '完成') + '</span>';
+        clearInterval(poll);
+        await loadConfigs();
+      }
+    }
+  }, 1500);
+  // 超时停止轮询
+  setTimeout(() => clearInterval(poll), 120000);
 }
 
 async function deleteConfig(id) {

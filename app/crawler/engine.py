@@ -93,7 +93,8 @@ def parse_twitter_api_tweet(tweet: dict) -> dict:
     return None
 
 
-def crawl_user_tweets(config: dict, max_tweets: int = MAX_TWEETS_PER_CRAWL) -> tuple[int, list[str]]:
+def crawl_user_tweets(config: dict, max_tweets: int = MAX_TWEETS_PER_CRAWL,
+                     status_callback=None) -> tuple[int, list[str]]:
     """
     爬取指定用户的推文
     返回 (爬取成功数, [错误信息])
@@ -139,9 +140,10 @@ def crawl_user_tweets(config: dict, max_tweets: int = MAX_TWEETS_PER_CRAWL) -> t
             # 先访问用户页面获取用户信息
             random_delay()
 
-            # 使用 X API 的 UserTweets 端点
-            # 首先获取用户ID
+            # 获取用户信息
             user_by_screen_name_url = f"https://api.x.com/1.1/users/show.json?screen_name={screen_name}"
+            if status_callback:
+                status_callback(f"正在获取用户 @{screen_name} 信息...")
             resp = client.get(user_by_screen_name_url)
             simulate_reading_time(resp.text[:200])
             random_delay()
@@ -181,10 +183,12 @@ def crawl_user_tweets(config: dict, max_tweets: int = MAX_TWEETS_PER_CRAWL) -> t
             if not isinstance(tweets, list):
                 return 0, [f"意外的响应格式"]
 
-            # 过滤已爬取过的
             new_tweets = tweets[:max_tweets]
+            total = len(new_tweets)
+            if status_callback:
+                status_callback(f"获取到 {total} 条推文，开始爬取...")
 
-            for tweet_data in new_tweets:
+            for idx, tweet_data in enumerate(new_tweets):
                 tweet = tweet_data.get("retweeted_status", tweet_data)
                 full_text = tweet.get("full_text", tweet.get("text", ""))
 
@@ -228,6 +232,9 @@ def crawl_user_tweets(config: dict, max_tweets: int = MAX_TWEETS_PER_CRAWL) -> t
 
                 save_tweet(config["id"], tweet_record)
                 count += 1
+
+                if status_callback and total > 0:
+                    status_callback(f"爬取进度: {count}/{total}")
 
                 # 提取链接并保存
                 links = extract_tweet_links(full_text)
